@@ -1,8 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
-const { query } = require("express");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -11,6 +10,9 @@ app.use(express.json());
 require("dotenv").config();
 //pass:
 //user:
+
+const stripe = require("stripe")(process.env.STRIPE_SECRET);
+
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.z1jayhr.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -25,12 +27,12 @@ function verifyJWT(req, res, next) {
   console.log("token inside verify jwt", req.headers.authorization);
   const authHeader = req.headers.authorization;
   if (!authHeader) {
-    return res.status(401).send("unauthorised access");
+    return res.status(401).send({ message: "unauthorised access" });
   }
   const token = authHeader.split(" ")[1]; //taking without bearer
   jwt.verify(token, process.env.ACCESS_TOKEN, function (err, decoded) {
     if (err) {
-      return res.status;
+      return res.status(401).send({ message: "unauthorised access" });
     }
 
     req.decoded = decoded;
@@ -47,6 +49,32 @@ async function run() {
       .db("doctorsPortal")
       .collection("bookings");
     const userCollections = client.db("doctorsPortal").collection("user");
+    const paymentCollection=client.db("doctorsPortal").collection("payments")
+
+    //Jwonwebtoken
+    app.post("/jwt", (req, res) => {
+      const user = req.body;
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN);
+      res.send({ token });
+    });
+
+    //add price to all services (temporary),needed once
+
+    // app.get("/addPrice", async (req, res) => {
+    //   const filter = {};
+    //   const options = { upsert: true };
+    //   const updatedDoc = {
+    //     $set: {
+    //       price: 99,
+    //     },
+    //   };
+    //   const result = await appointmentOptionCollection.updateMany(
+    //     filter,
+    //     updatedDoc,
+    //     options
+    //   );
+    //   res.send(result);
+    // });
 
     //Use aggregate to query multiple collection and then merge data
     // module 74.5-6
@@ -113,6 +141,7 @@ async function run() {
             $project: {
               name: 1,
               slots: 1,
+              price: 1,
               booked: {
                 $map: {
                   input: "$booked",
@@ -125,6 +154,7 @@ async function run() {
           {
             $project: {
               name: 1,
+              price: 1,
               slots: {
                 $setDifference: ["$slots", "$booked"],
               },
@@ -132,7 +162,7 @@ async function run() {
           },
         ])
         .toArray();
-        
+
       res.send(options);
     });
 
@@ -148,19 +178,21 @@ async function run() {
      */
 
     //to get my bookings (with email)
-    app.get("/bookings", verifyJWT, async (req, res) => {
+    app.get("/bookings", async (req, res) => {
       const email = req.query.email; // when fetch will add ?email=email, but api is '/bookings'
-      const decodedEmail = req.decoded.email;
-      // console.log('token', req.headers.authorization)
-      if (email != decodedEmail) {
-        return res.status(403).send({ message: "fobiden access" });
-      }
+      // const decoded = req.decoded;
+      // // console.log('token', req.headers.authorization)
+      // if (decoded.email !== req.query.email) {
+      //   return res.status(403).send({ message: "forbiden access" });
+      // }
 
       const query = { email: email };
 
       const bookings = await bookingCollections.find(query).toArray();
       res.send(bookings);
     });
+
+   
 
     //to post booking
     app.post("/bookings", async (req, res) => {
@@ -183,21 +215,52 @@ async function run() {
       // console.log(result);
     });
 
-    //Jwt create and sending to client from here
+     // get specific booking for payment
+     app.get('/bookings/:id', async (req,res)=>{
+      const id = req.params.id
+      const query= {_id: new ObjectId(id)}
+      const booking= await bookingCollections.findOne(query)
+      res.send(booking)
+    })
 
-    app.get("/jwt", async (req, res) => {
-      const email = req.query.email;
-      const query = { email: email };
-      const user = await userCollections.findOne(query);
-      if (user) {
-        const token = jwt.sign({ email }, process.env.ACCESS_TOKEN, {
-          expiresIn: "1h",
-        });
-        return res.send({ accessToken: token });
+    //stripe payment intent
+
+    app.post('/create-payment-intent', async(req,res)=>{
+      const booking= req.body 
+      const price= booking.price 
+      const amount = price*100 
+      const paymentIntent= await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        "payment_method_types": [
+          "card"
+        ],
+      })
+
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      })
+    })
+
+    //post payment innfo 
+    app.post('/payments', async(req,res)=> {
+      const payment= req.body 
+      const result= await paymentCollection.insertOne(payment)
+      //update payment status in booking collection as well
+      const id= payment.bookingId 
+      const filter= {_id: new ObjectId(id)}
+      const updatedDoc= {
+        $set: {
+          paid: true,
+          trasactionId: payment.trasactionId
+        }
       }
-      console.log(user);
-      res.status(403).send({ accessToken: "" });
-    });
+      const updatedResult= await bookingCollections.updateOne(filter, updatedDoc)
+
+      res.send(result)
+    })
+
+
 
     //user saving in db
     app.post("/users", async (req, res) => {
